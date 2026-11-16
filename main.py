@@ -1,82 +1,78 @@
-#!/usr/bin/env python3
-"""Copy the competition image to the make.fun output location."""
+"""Copy the competition artwork without changing its bytes."""
 
 import hashlib
 import os
 from pathlib import Path
 import shutil
-import struct
+import sys
+
+
+SOF_MARKERS = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 
 
 def jpeg_dimensions(data):
-    """Return (width, height) from a JPEG byte string."""
-    if not data.startswith(b"\xff\xd8"):
-        raise ValueError("entry.jpg is not a JPEG image")
-
-    index = 2
-    sof_markers = {
-        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
-    }
-    while index < len(data):
-        while index < len(data) and data[index] != 0xFF:
-            index += 1
-        while index < len(data) and data[index] == 0xFF:
-            index += 1
-        if index >= len(data):
+    """Read dimensions from a JPEG start-of-frame segment."""
+    pos = 2
+    while pos < len(data):
+        if data[pos] != 0xFF:
+            raise ValueError("invalid JPEG marker")
+        while pos < len(data) and data[pos] == 0xFF:
+            pos += 1
+        if pos >= len(data):
             break
-
-        marker = data[index]
-        index += 1
-        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+        marker = data[pos]
+        pos += 1
+        if marker in (0xD9, 0xDA):
+            break
+        if marker in {0x01, 0xD8, *range(0xD0, 0xD8)}:
             continue
-        if index + 2 > len(data):
-            break
-
-        segment_length = struct.unpack_from(">H", data, index)[0]
-        if segment_length < 2 or index + segment_length > len(data):
-            break
-        if marker in sof_markers:
-            if segment_length < 7:
-                break
-            height, width = struct.unpack_from(">HH", data, index + 3)
+        if pos + 2 > len(data):
+            raise ValueError("truncated JPEG segment length")
+        length = int.from_bytes(data[pos:pos + 2], "big")
+        if length < 2 or pos + length > len(data):
+            raise ValueError("invalid or truncated JPEG segment")
+        if marker in SOF_MARKERS:
+            if length < 8:
+                raise ValueError("truncated JPEG SOF segment")
+            height = int.from_bytes(data[pos + 3:pos + 5], "big")
+            width = int.from_bytes(data[pos + 5:pos + 7], "big")
             return width, height
-        if marker == 0xDA:  # Start of scan; no frame header was found.
-            break
-        index += segment_length
-
-    raise ValueError("could not find JPEG dimensions")
+        pos += length
+    raise ValueError("JPEG SOF marker not found")
 
 
 def main():
-    script_dir = Path(__file__).resolve().parent
-    beside_script = script_dir / "entry.jpg"
-    source = beside_script if beside_script.is_file() else Path.cwd() / "entry.jpg"
+    source = Path(__file__).resolve().parent / "entry.jpg"
     if not source.is_file():
-        raise FileNotFoundError("entry.jpg not found beside the script or in the working directory")
-
-    source_bytes = source.read_bytes()
-    if len(source_bytes) > 1048576:
-        raise ValueError(f"entry.jpg is too large: {len(source_bytes)} bytes (maximum 1048576)")
-    if not source_bytes.startswith(b"\xff\xd8"):
-        raise ValueError("entry.jpg is not a JPEG: missing SOI marker (ffd8) at the start")
-    if not source_bytes.endswith(b"\xff\xd9"):
-        raise ValueError("entry.jpg is not a complete JPEG: missing EOI marker (ffd9) at the end")
-
-    width, height = jpeg_dimensions(source_bytes)
-    if width > 1024 or height > 1024:
-        raise ValueError(f"entry.jpg dimensions exceed 1024 px per side: {width}x{height}")
-
-    digest = hashlib.sha256(source_bytes).hexdigest()
+        source = Path.cwd() / "entry.jpg"
+    max_bytes = 1048576
+    if source.stat().st_size > max_bytes:
+        raise ValueError(f"JPEG exceeds the {max_bytes}-byte limit")
+    data = source.read_bytes()
+    if len(data) > max_bytes:
+        raise ValueError(f"JPEG exceeds the {max_bytes}-byte limit")
+    if not data.startswith(b"\xff\xd8"):
+        raise ValueError("JPEG is missing the SOI marker (ffd8) at the start")
+    if not data.endswith(b"\xff\xd9"):
+        raise ValueError("JPEG is missing the EOI marker (ffd9) at the end")
+    width, height = jpeg_dimensions(data)
+    if not (0 < width <= 1024 and 0 < height <= 1024):
+        raise ValueError(f"JPEG dimensions {width}x{height} must be 1–1024 px per side")
+    digest = hashlib.sha256(data).hexdigest()
     destination = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")) / "entry.png"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination)
-
     copied_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
     if copied_digest != digest:
-        raise OSError(f"copied file sha256 mismatch: source {digest}, copy {copied_digest}")
-    print(f"ai-excited-01 -> {destination} | {len(source_bytes)} bytes | {width}x{height} | sha256 {digest}")
+        raise ValueError("copied file SHA256 does not match the source")
+    print(f"ai-excited-01 -> {destination} | {len(data)} bytes | "
+          f"{width}x{height} | sha256 {digest}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
